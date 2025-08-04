@@ -14,7 +14,6 @@ class DefaultBranchingStrategy:
     def should_branch(self, _seq_len: int, context: dict) -> bool:
         return True
 
-
 class TreeNode:
     def __init__(self, node_id: int, parent_id: int = None):
         self.node_id = node_id
@@ -233,3 +232,62 @@ class TreeRollout(vLLMRollout):
         return self.tree_nodes
 
 
+    def propagate_rewards_to_parents(self, reward_proto: DataProto, leaf_id_to_batch_idx: Dict[int, int]):
+        """
+        Assign rewards to leaf nodes using computed rm_scores,
+        then propagate average rewards back up the tree to all parents.
+        """
+        assert "rm_scores" in reward_proto.batch, "rm_scores missing in reward output"
+        rm_scores = reward_proto.batch["rm_scores"]  # shape: [B, T]
+        token_rewards = rm_scores.float().mean(dim=1)  # shape: [B], average per sequence
+
+        # Assign leaf rewards by using the self mapping 
+        for leaf_id, batch_idx in leaf_id_to_batch_idx.items():
+            self.tree_nodes[leaf_id].reward = token_rewards[batch_idx].item()
+
+        # Propagate upwards using algo similar to TreeRPO
+        # sorting to process from leaves to root
+        nodes_by_depth = sorted(self.tree_nodes.values(), key=lambda n: -n.depth)
+
+        # 
+        for node in nodes_by_depth:
+            if node.reward is not None:
+                continue  # already a leaf
+            if not node.children:
+                continue  # safety check
+
+            #  average of children's rewards
+            child_rewards = [self.tree_nodes[child.node_id].reward for child in node.children if self.tree_nodes[child.node_id].reward is not None]
+            if child_rewards:
+                node.reward = sum(child_rewards) / len(child_rewards)
+            else:
+                node.reward = 0.0  # fallback 
+
+
+    def collect_concatenated_rewards_for_leaf_paths(self) -> torch.Tensor:
+        """Concatenate rewards along each root→leaf path; pad to max length across leaves."""
+        reward_sequences = []
+        for batch_id, leaf_id in self.batch_id_to_leaf_id.items():
+            node = self.tree_nodes[leaf_id]
+            parts = []
+            while node is not None:
+                if node.reward is None:
+                    raise ValueError(f"Node {node.node_id} has no reward.")
+                parts.append(node.reward)           # collect leaf→root
+                node = self.tree_nodes.get(node.parent_id)
+            parts = list(reversed(parts))           # root→leaf
+            reward_sequences.append(torch.cat(parts, dim=0))
+
+        max_len = max(r.size(0) for r in reward_sequences)
+        padded = torch.stack([
+            torch.cat([r, r.new_zeros(max_len - r.size(0))]) if r.size(0) < max_len else r
+            for r in reward_sequences
+        ])
+        return padded  # [num_leaves, max_total_tokens_along_path]
+
+    def get_tree_rewards(self) -> DataProto:
+        """Return DataProto like compute_rm_score: {'rm_scores': token_level_rewards}
+        This happens after the reward propagation is already completed.
+        """
+        token_level_rewards = self.collect_concatenated_rewards_for_leaf_paths()
+        return DataProto.from_dict(tensors={"rm_scores": token_level_rewards})
