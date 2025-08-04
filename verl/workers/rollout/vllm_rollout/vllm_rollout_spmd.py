@@ -51,10 +51,12 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.worker.worker_base import WorkerWrapperBase
 
+from typing import List, Dict, Callable, Tuple
 from verl import DataProto
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
+from collections import deque
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -499,3 +501,297 @@ class vLLMAsyncRollout:
             return self.wake_up(*args, **kwargs)
         else:
             return self.inference_engine.execute_method(method, *args, **kwargs)
+
+
+
+class DefaultBranchingStrategy:
+    # it just branches at a default token length every node (k tokens each node)
+    def should_branch(self, _seq_len: int, context: dict) -> bool:
+        return True
+
+class TreeNode:
+    def __init__(self, node_id: int, parent_id: int = None):
+        self.node_id = node_id
+        self.parent_id = parent_id
+        self.children = []
+        self.sequence = None
+        self.reward = None
+        self.is_leaf = True
+        self.generated_tokens = []
+        self.depth = 0
+        self.prompt_len = 0
+
+
+class TreeRollout(vLLMRollout):
+    def __init__(
+        self,
+        model_path: str,
+        config: DictConfig,
+        tokenizer,
+        model_hf_config,
+        branching_strategy = None,
+        max_depth: int = 3,
+        **kwargs,
+    ):
+        super().__init__(model_path, config, tokenizer, model_hf_config, **kwargs)
+        self.tokenizer = tokenizer              # base class doesn’t store this
+        if self.branching_strategy is None:
+            self.branching_strategy = DefaultBranchingStrategy()
+        self.max_depth = max_depth
+        self.tree_nodes: Dict[int, TreeNode] = {}
+        self.step_groups: Dict[int, List[int]] = {}
+        self.config = config
+        self.prompt_length = config.prompt_length  # default prompt length
+        self.max_response_length = config.response_length  # default max response length
+      
+
+    # Build a single-item DataProto using tokenizer-based left padding
+    def _build_dataproto(self, token_ids: List[int]) -> DataProto:
+        self.tokenizer.padding_side = "left"
+        padded = self.tokenizer.pad(
+            [{"input_ids": token_ids}],
+            padding="max_length",
+            max_length=self.config.prompt_length,  # from vLLMRollout config
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        input_ids = padded["input_ids"]                  # (1, prompt_len)
+        attention_mask = padded["attention_mask"]        # (1, prompt_len)
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)  # (1, prompt_len)
+
+        batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=1,
+        )
+        non_tensor_batch = {"raw_prompt_ids": np.array([token_ids], dtype=object)}
+        meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "do_sample": True,
+        }
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
+
+    def generate_tokens_from_verl(self, input_tokens: List[int], num_tokens: int, **kwargs) -> List[int]:
+        dp = self._build_dataproto(input_tokens)
+        out = self.generate_sequences(dp, **kwargs)  # method from vLLMRollout
+        resp = out.batch["responses"][0].tolist()
+        return resp[:num_tokens]
+
+
+    def build_leaf_reward_batch(self) -> Tuple[DataProto, Dict[int, int]]:
+        """
+        Build a batch (DataProto) from all leaves, matching vLLM generate_sequences:
+          - prompts:        [B, prompt_length]         (left-padded)
+          - responses:      [B, response_length]       (right-padded)
+          - input_ids:      [B, prompt_length + response_length]
+          - attention_mask: [B, prompt_length + response_length]
+          - position_ids:   [B, prompt_length + response_length]
+        Returns: (batch, leaf_id_to_batch_idx)
+        """
+        leaves: List[TreeNode] = [n for n in self.tree_nodes.values() if n.is_leaf]
+        if not leaves:
+            raise ValueError("No leaf nodes to build reward batch.")
+
+        leaf_ids: List[int] = [n.node_id for n in leaves]
+        seqs: List[List[int]] = [n.sequence for n in leaves]
+        p_lens: List[int] = [n.prompt_len for n in leaves]
+
+        prompt_len = int(self.config.prompt_length)
+        resp_len = int(self.config.response_length)
+        pad_id = self.tokenizer.pad_token_id
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+
+        # Left-pad prompts to prompt_len
+        raw_prompts = [seq[:pl] for seq, pl in zip(seqs, p_lens)]
+        self.tokenizer.padding_side = "left"
+        prompts_pad = self.tokenizer.pad(
+            [{"input_ids": rp} for rp in raw_prompts],
+            padding="max_length",
+            max_length=prompt_len,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        idx = prompts_pad["input_ids"]                 # [B, prompt_len]
+        prompt_attn = prompts_pad["attention_mask"]    # [B, prompt_len]
+
+        # Right-pad responses to resp_len
+        responses_list = [seq[pl:] for seq, pl in zip(seqs, p_lens)]
+        response = pad_2d_list_to_length(responses_list, pad_token_id=pad_id, max_length=resp_len)
+
+        seq = torch.cat([idx, response], dim=-1)       # [B, prompt_len + resp_len]
+
+        # position_ids like vLLM generate_sequences
+        B = idx.size(0)
+        prompt_pos = torch.arange(prompt_len, device=idx.device).unsqueeze(0).expand(B, -1)
+        delta = torch.arange(1, resp_len + 1, device=idx.device).unsqueeze(0).expand(B, -1)
+        response_pos = prompt_pos[:, -1:].to(delta.dtype) + delta
+        position_ids = torch.cat([prompt_pos, response_pos], dim=-1)
+
+        # attention_mask: concat prompt mask with response mask
+        if eos_id is None:
+            response_mask = (response != pad_id).to(prompt_attn.dtype)
+        else:
+            response_mask = get_response_mask(response_id=response, eos_token=eos_id, dtype=prompt_attn.dtype)
+        attention_mask = torch.cat([prompt_attn, response_mask], dim=-1)
+
+        batch = TensorDict(
+            {
+                "prompts": idx,
+                "responses": response,
+                "input_ids": seq,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=B,
+        )
+
+        non_tensor_batch = {"uid": np.array([str(leaf_id) for leaf_id in leaf_ids], dtype=object)}
+        self.leaf_id_to_batch_idx = {leaf_id: i for i, leaf_id in enumerate(leaf_ids)}
+        self.batch_id_to_leaf_id = {i: leaf_id for i, leaf_id in enumerate(leaf_ids)}
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch), self.leaf_id_to_batch_idx
+
+
+    def extract_leaf_paths(self, tree_data: Dict[int, TreeNode]) -> List[List[TreeNode]]:
+        paths = []
+        for node in tree_data.values():
+            if node.is_leaf:
+                path = []
+                cur = node
+                while cur is not None:
+                    path.append(cur)
+                    cur = tree_data.get(cur.parent_id)
+                paths.append(list(reversed(path)))
+        return paths
+
+    def create_tree(
+        self,
+        prompts: DataProto,
+        branching_config: Callable[[int], int],
+        tokens_per_step_config: Callable[[int], int],
+        **kwargs,
+    ) -> Dict[int, TreeNode]:
+        """Build a forest: one root per prompt in `prompts`."""
+        self.tree_nodes.clear()
+        self.step_groups.clear()
+
+
+        raw_all = prompts.non_tensor_batch["raw_prompt_ids"]  # np.array of lists
+        q = deque()
+        next_id = 0
+
+        # Create roots (one per prompt)
+        for root_idx, raw_prompt in enumerate(raw_all):
+            root = TreeNode(node_id=next_id, parent_id=None)
+            root.sequence = list(raw_prompt)
+            root.depth = 0
+            root.prompt_len = len(raw_prompt)
+            root.root_id = root_idx
+            self.tree_nodes[next_id] = root
+            self.step_groups.setdefault(0, []).append(next_id)
+            q.append(root)
+            next_id += 1
+
+        # BFS over the forest
+        while q:
+            node = q.popleft()
+            node.depth = 0 if node.parent_id is None else self.tree_nodes[node.parent_id].depth + 1
+            if node.depth >= self.max_depth:
+                continue
+
+            self.step_groups.setdefault(node.depth, []).append(node.node_id)
+
+            to_gen = max(0, int(tokens_per_step_config(node.depth)))
+            if to_gen > 0:
+                gen_tokens = self.generate_tokens_from_verl(node.sequence, to_gen, **kwargs)
+            else:
+                gen_tokens = []
+            node.generated_tokens = gen_tokens
+            node.sequence = node.sequence + gen_tokens
+
+            # Stop branching if generated length hits response_length
+            generated_len = len(node.sequence) - node.prompt_len
+            if generated_len >= self.max_response_length:
+                # keep as leaf, do not expand
+                continue
+
+            # Branch if strategy says so
+            if self.branching_strategy.should_branch(len(node.sequence), context={"node": node}):
+                num_children = int(branching_config(node.depth))
+                for _ in range(max(0, num_children)):
+                    child = TreeNode(node_id=next_id, parent_id=node.node_id)
+                    child.sequence = list(node.sequence)    # copy!
+                    child.depth = node.depth + 1
+                    child.prompt_len = node.prompt_len
+                    child.root_id = node.root_id
+                    node.children.append(child)
+                    node.is_leaf = False
+                    self.tree_nodes[next_id] = child
+                    q.append(child)
+                    next_id += 1
+
+        return self.tree_nodes
+
+    def propagate_rewards_to_parents(self, reward_proto: DataProto, leaf_id_to_batch_idx: Dict[int, int]):
+        """
+        Assign rewards to leaf nodes using computed rm_scores,
+        then propagate average rewards back up the tree to all parents.
+        """
+        assert "rm_scores" in reward_proto.batch, "rm_scores missing in reward output"
+        rm_scores = reward_proto.batch["rm_scores"]  # shape: [B, T]
+        token_rewards = rm_scores.float().mean(dim=1)  # shape: [B], average per sequence
+
+        # Assign leaf rewards by using the self mapping 
+        for leaf_id, batch_idx in leaf_id_to_batch_idx.items():
+            self.tree_nodes[leaf_id].reward = token_rewards[batch_idx].item()
+
+        # Propagate upwards using algo similar to TreeRPO
+        # sorting to process from leaves to root
+        nodes_by_depth = sorted(self.tree_nodes.values(), key=lambda n: -n.depth)
+
+        # 
+        for node in nodes_by_depth:
+            if node.reward is not None:
+                continue  # already a leaf
+            if not node.children:
+                continue  # safety check
+
+            #  average of children's rewards
+            child_rewards = [self.tree_nodes[child.node_id].reward for child in node.children if self.tree_nodes[child.node_id].reward is not None]
+            if child_rewards:
+                node.reward = sum(child_rewards) / len(child_rewards)
+            else:
+                node.reward = 0.0  # fallback 
+
+
+    def collect_concatenated_rewards_for_leaf_paths(self) -> torch.Tensor:
+        """Concatenate rewards along each root→leaf path; pad to max length across leaves."""
+        reward_sequences = []
+        for batch_id, leaf_id in self.batch_id_to_leaf_id.items():
+            node = self.tree_nodes[leaf_id]
+            parts = []
+            while node is not None:
+                if node.reward is None:
+                    raise ValueError(f"Node {node.node_id} has no reward.")
+                parts.append(node.reward)           # collect leaf→root
+                node = self.tree_nodes.get(node.parent_id)
+            parts = list(reversed(parts))           # root→leaf
+            reward_sequences.append(torch.cat(parts, dim=0))
+
+        max_len = max(r.size(0) for r in reward_sequences)
+        padded = torch.stack([
+            torch.cat([r, r.new_zeros(max_len - r.size(0))]) if r.size(0) < max_len else r
+            for r in reward_sequences
+        ])
+        return padded  # [num_leaves, max_total_tokens_along_path]
+
+    def get_tree_rewards(self) -> DataProto:
+        """Return DataProto like compute_rm_score: {'rm_scores': token_level_rewards}
+        This happens after the reward propagation is already completed.
+        """
+        token_level_rewards = self.collect_concatenated_rewards_for_leaf_paths()
+        return DataProto.from_dict(tensors={"rm_scores": token_level_rewards})

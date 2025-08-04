@@ -24,6 +24,7 @@ class TreeNode:
         self.is_leaf = True
         self.generated_tokens = []
         self.depth = 0
+        self.prompt_len = 0
 
 class TreeRollout(vLLMRollout):
     def __init__(
@@ -43,6 +44,8 @@ class TreeRollout(vLLMRollout):
         self.max_depth = max_depth
         self.tree_nodes: Dict[int, TreeNode] = {}
         self.step_groups: Dict[int, List[int]] = {}
+        self.config = config
+        self.prompt_length = config.prompt_length  # default prompt length
         self.max_response_length = config.response_length  # default max response length
       
 
@@ -83,34 +86,31 @@ class TreeRollout(vLLMRollout):
         return resp[:num_tokens]
 
 
-    def build_leaf_reward_batch(self) -> Tuple[DataProto, List[int]]:
+    def build_leaf_reward_batch(self) -> Tuple[DataProto, Dict[int, int]]:
         """
-        Build a DataProto from all leaf (root→leaf) sequences, matching the shape/logic
-        of vLLMRollout.generate_sequences:
-        - prompts:        [B, prompt_length]
-        - responses:      [B, response_length]
-        - input_ids:      [B, prompt_length + response_length]  (concat of prompts & responses)
-        - attention_mask: [B, prompt_length + response_length]
-        - position_ids:   [B, prompt_length + response_length]
-
-        Returns: (DataProto, leaf_node_ids)
+        Build a batch (DataProto) from all leaves, matching vLLM generate_sequences:
+          - prompts:        [B, prompt_length]         (left-padded)
+          - responses:      [B, response_length]       (right-padded)
+          - input_ids:      [B, prompt_length + response_length]
+          - attention_mask: [B, prompt_length + response_length]
+          - position_ids:   [B, prompt_length + response_length]
+        Returns: (batch, leaf_id_to_batch_idx)
         """
         leaves: List[TreeNode] = [n for n in self.tree_nodes.values() if n.is_leaf]
+        if not leaves:
+            raise ValueError("No leaf nodes to build reward batch.")
+
         leaf_ids: List[int] = [n.node_id for n in leaves]
         seqs: List[List[int]] = [n.sequence for n in leaves]
+        p_lens: List[int] = [n.prompt_len for n in leaves]
 
         prompt_len = int(self.config.prompt_length)
         resp_len = int(self.config.response_length)
-        total_len = prompt_len + resp_len
-
         pad_id = self.tokenizer.pad_token_id
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
 
-        if not hasattr(self, "prompt_len"):
-            raise RuntimeError("TreeRollout: self.prompt_len is required. Set it in create_tree().")
-
-        # left-padding raw prompt tokens to prompt_len 
-        raw_prompts = [seq[: self.prompt_len] for seq in seqs]
+        # Left-pad prompts to prompt_len
+        raw_prompts = [seq[:pl] for seq, pl in zip(seqs, p_lens)]
         self.tokenizer.padding_side = "left"
         prompts_pad = self.tokenizer.pad(
             [{"input_ids": rp} for rp in raw_prompts],
@@ -122,21 +122,20 @@ class TreeRollout(vLLMRollout):
         idx = prompts_pad["input_ids"]                 # [B, prompt_len]
         prompt_attn = prompts_pad["attention_mask"]    # [B, prompt_len]
 
-        #  Build responses by right-padding/truncating to resp_len 
-        responses_list = [seq[self.prompt_len:] for seq in seqs]
+        # Right-pad responses to resp_len
+        responses_list = [seq[pl:] for seq, pl in zip(seqs, p_lens)]
         response = pad_2d_list_to_length(responses_list, pad_token_id=pad_id, max_length=resp_len)
 
-        # following gen_sequences setup
-        seq = torch.cat([idx, response], dim=-1)       # [B, total_len]
+        seq = torch.cat([idx, response], dim=-1)       # [B, prompt_len + resp_len]
 
-    
+        # position_ids like vLLM generate_sequences
         B = idx.size(0)
         prompt_pos = torch.arange(prompt_len, device=idx.device).unsqueeze(0).expand(B, -1)
         delta = torch.arange(1, resp_len + 1, device=idx.device).unsqueeze(0).expand(B, -1)
         response_pos = prompt_pos[:, -1:].to(delta.dtype) + delta
-        position_ids = torch.cat([prompt_pos, response_pos], dim=-1)  # [B, total_len]
+        position_ids = torch.cat([prompt_pos, response_pos], dim=-1)
 
-        #  attention_mask: concat prompt mask with response mask (Verl util) 
+        # attention_mask: concat prompt mask with response mask
         if eos_id is None:
             response_mask = (response != pad_id).to(prompt_attn.dtype)
         else:
@@ -154,14 +153,12 @@ class TreeRollout(vLLMRollout):
             batch_size=B,
         )
 
-        non_tensor_batch = {
-            "uid": np.array([str(leaf_id) for leaf_id in leaf_ids], dtype=object)
-        }
-
+        non_tensor_batch = {"uid": np.array([str(leaf_id) for leaf_id in leaf_ids], dtype=object)}
         self.leaf_id_to_batch_idx = {leaf_id: i for i, leaf_id in enumerate(leaf_ids)}
         self.batch_id_to_leaf_id = {i: leaf_id for i, leaf_id in enumerate(leaf_ids)}
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch), leaf_ids
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch), self.leaf_id_to_batch_idx
+
 
     def extract_leaf_paths(self, tree_data: Dict[int, TreeNode]) -> List[List[TreeNode]]:
         paths = []
@@ -182,24 +179,28 @@ class TreeRollout(vLLMRollout):
         tokens_per_step_config: Callable[[int], int],
         **kwargs,
     ) -> Dict[int, TreeNode]:
-        self.tree_nodes = {}
-        self.step_groups = {}
-
-        # Use unpadded prompt tokens provided in DataProto
-        root_input_ids = prompts.non_tensor_batch["raw_prompt_ids"][0]
-        root = TreeNode(node_id=0)
-        root.sequence = list(root_input_ids)
-        root.depth = 0
-        self.tree_nodes[0] = root
-        self.step_groups[0] = [0]
-
-       
-        self.prompt_len = len(root_input_ids)
+        """Build a forest: one root per prompt in `prompts`."""
+        self.tree_nodes.clear()
+        self.step_groups.clear()
 
 
-        q = deque([root])
-        next_id = 1
+        raw_all = prompts.non_tensor_batch["raw_prompt_ids"]  # np.array of lists
+        q = deque()
+        next_id = 0
 
+        # Create roots (one per prompt)
+        for root_idx, raw_prompt in enumerate(raw_all):
+            root = TreeNode(node_id=next_id, parent_id=None)
+            root.sequence = list(raw_prompt)
+            root.depth = 0
+            root.prompt_len = len(raw_prompt)
+            root.root_id = root_idx
+            self.tree_nodes[next_id] = root
+            self.step_groups.setdefault(0, []).append(next_id)
+            q.append(root)
+            next_id += 1
+
+        # BFS over the forest
         while q:
             node = q.popleft()
             node.depth = 0 if node.parent_id is None else self.tree_nodes[node.parent_id].depth + 1
@@ -208,21 +209,29 @@ class TreeRollout(vLLMRollout):
 
             self.step_groups.setdefault(node.depth, []).append(node.node_id)
 
-            to_gen = tokens_per_step_config(node.depth)
-            gen_tokens = self.generate_tokens_from_verl(node.sequence, to_gen, **kwargs)
+            to_gen = max(0, int(tokens_per_step_config(node.depth)))
+            if to_gen > 0:
+                gen_tokens = self.generate_tokens_from_verl(node.sequence, to_gen, **kwargs)
+            else:
+                gen_tokens = []
             node.generated_tokens = gen_tokens
             node.sequence = node.sequence + gen_tokens
 
-            if len(node.sequence) >= self.max_response_length:
-                # keep node as leaf (no children)
+            # Stop branching if generated length hits response_length
+            generated_len = len(node.sequence) - node.prompt_len
+            if generated_len >= self.max_response_length:
+                # keep as leaf, do not expand
                 continue
 
+            # Branch if strategy says so
             if self.branching_strategy.should_branch(len(node.sequence), context={"node": node}):
-                num_children = branching_config(node.depth)
-                for _ in range(num_children):
+                num_children = int(branching_config(node.depth))
+                for _ in range(max(0, num_children)):
                     child = TreeNode(node_id=next_id, parent_id=node.node_id)
-                    child.sequence = node.sequence  # branch from the updated sequence
+                    child.sequence = list(node.sequence)    # copy!
                     child.depth = node.depth + 1
+                    child.prompt_len = node.prompt_len
+                    child.root_id = node.root_id
                     node.children.append(child)
                     node.is_leaf = False
                     self.tree_nodes[next_id] = child
@@ -230,7 +239,6 @@ class TreeRollout(vLLMRollout):
                     next_id += 1
 
         return self.tree_nodes
-
 
     def propagate_rewards_to_parents(self, reward_proto: DataProto, leaf_id_to_batch_idx: Dict[int, int]):
         """
