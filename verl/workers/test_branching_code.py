@@ -39,11 +39,10 @@ class TreeRollout(vLLMRollout):
     ):
         super().__init__(model_path, config, tokenizer, model_hf_config, **kwargs)
         self.tokenizer = tokenizer              # base class doesn’t store this
-        if self.branching_strategy is None:
-            self.branching_strategy = DefaultBranchingStrategy()
+        self.branching_strategy = branching_strategy or DefaultBranchingStrategy()
+
         self.max_depth = max_depth
         self.tree_nodes: Dict[int, TreeNode] = {}
-        self.step_groups: Dict[int, List[int]] = {}
         self.config = config
         self.prompt_length = config.prompt_length  # default prompt length
         self.max_response_length = config.response_length  # default max response length
@@ -153,7 +152,11 @@ class TreeRollout(vLLMRollout):
             batch_size=B,
         )
 
-        non_tensor_batch = {"uid": np.array([str(leaf_id) for leaf_id in leaf_ids], dtype=object)}
+        non_tensor_batch = {
+            "leaf_id": np.array([int(l) for l in leaf_ids], dtype=np.int64),
+            "root_id": np.array([self.tree_nodes[l].root_id for l in leaf_ids], dtype=np.int64),
+        }       
+
         self.leaf_id_to_batch_idx = {leaf_id: i for i, leaf_id in enumerate(leaf_ids)}
         self.batch_id_to_leaf_id = {i: leaf_id for i, leaf_id in enumerate(leaf_ids)}
 
@@ -181,8 +184,6 @@ class TreeRollout(vLLMRollout):
     ) -> Dict[int, TreeNode]:
         """Build a forest: one root per prompt in `prompts`."""
         self.tree_nodes.clear()
-        self.step_groups.clear()
-
 
         raw_all = prompts.non_tensor_batch["raw_prompt_ids"]  # np.array of lists
         q = deque()
@@ -196,7 +197,6 @@ class TreeRollout(vLLMRollout):
             root.prompt_len = len(raw_prompt)
             root.root_id = root_idx
             self.tree_nodes[next_id] = root
-            self.step_groups.setdefault(0, []).append(next_id)
             q.append(root)
             next_id += 1
 
@@ -207,7 +207,6 @@ class TreeRollout(vLLMRollout):
             if node.depth >= self.max_depth:
                 continue
 
-            self.step_groups.setdefault(node.depth, []).append(node.node_id)
 
             to_gen = max(0, int(tokens_per_step_config(node.depth)))
             if to_gen > 0:
@@ -240,7 +239,7 @@ class TreeRollout(vLLMRollout):
 
         return self.tree_nodes
 
-    def propagate_rewards_to_parents(self, reward_proto: DataProto, leaf_id_to_batch_idx: Dict[int, int]):
+    def propagate_rewards_to_parents(self, reward_proto: DataProto):
         """
         Assign rewards to leaf nodes using computed rm_scores,
         then propagate average rewards back up the tree to all parents.
@@ -250,7 +249,7 @@ class TreeRollout(vLLMRollout):
         token_rewards = rm_scores.float().mean(dim=1)  # shape: [B], average per sequence
 
         # Assign leaf rewards by using the self mapping 
-        for leaf_id, batch_idx in leaf_id_to_batch_idx.items():
+        for leaf_id, batch_idx in self.leaf_id_to_batch_idx.items():
             self.tree_nodes[leaf_id].reward = token_rewards[batch_idx].item()
 
         # Propagate upwards using algo similar to TreeRPO
@@ -271,27 +270,26 @@ class TreeRollout(vLLMRollout):
             else:
                 node.reward = 0.0  # fallback 
 
-
     def collect_concatenated_rewards_for_leaf_paths(self) -> torch.Tensor:
-        """Concatenate rewards along each root→leaf path; pad to max length across leaves."""
+        assert hasattr(self, "batch_id_to_leaf_id"), "build_leaf_reward_batch() must be called first."
         reward_sequences = []
-        for batch_id, leaf_id in self.batch_id_to_leaf_id.items():
+        for _, leaf_id in self.batch_id_to_leaf_id.items():
             node = self.tree_nodes[leaf_id]
             parts = []
             while node is not None:
                 if node.reward is None:
                     raise ValueError(f"Node {node.node_id} has no reward.")
-                parts.append(node.reward)           # collect leaf→root
+                parts.append(torch.tensor([node.reward], dtype=torch.float32))
                 node = self.tree_nodes.get(node.parent_id)
-            parts = list(reversed(parts))           # root→leaf
-            reward_sequences.append(torch.cat(parts, dim=0))
+            reward_sequences.append(torch.cat(list(reversed(parts)), dim=0))
 
         max_len = max(r.size(0) for r in reward_sequences)
         padded = torch.stack([
             torch.cat([r, r.new_zeros(max_len - r.size(0))]) if r.size(0) < max_len else r
             for r in reward_sequences
         ])
-        return padded  # [num_leaves, max_total_tokens_along_path]
+        return padded
+
 
     def get_tree_rewards(self) -> DataProto:
         """Return DataProto like compute_rm_score: {'rm_scores': token_level_rewards}
@@ -299,3 +297,56 @@ class TreeRollout(vLLMRollout):
         """
         token_level_rewards = self.collect_concatenated_rewards_for_leaf_paths()
         return DataProto.from_dict(tensors={"rm_scores": token_level_rewards})
+
+
+    def select_leaves_per_prompt(
+        self,
+        leaf_batch: DataProto,
+        n: int = 5,
+        strategy: str = "first",  # or "random"
+        rng: torch.Generator | None = None,
+    ) -> DataProto:
+        """
+        Keep at most `n` leaves per original prompt (root_id), preserving order by default.
+        Also rebuilds self.leaf_id_to_batch_idx / self.batch_id_to_leaf_id to match the slice.
+        """
+        # use the explicit fields you set in build_leaf_reward_batch
+        assert "leaf_id" in leaf_batch.non_tensor_batch and "root_id" in leaf_batch.non_tensor_batch, \
+            "leaf_batch must carry 'leaf_id' and 'root_id' in non_tensor_batch."
+
+        leaf_ids = leaf_batch.non_tensor_batch["leaf_id"].tolist()
+        root_ids = leaf_batch.non_tensor_batch["root_id"].tolist()
+
+        # group batch indices by root_id
+        per_root_to_indices: dict[int, list[int]] = {}
+        for i, rid in enumerate(root_ids):
+            per_root_to_indices.setdefault(int(rid), []).append(i)
+
+        # pick up to n indices per root (first or random)
+        selected_indices: list[int] = []
+        strategy = strategy.lower()
+        if strategy == "first":
+            for rid, idxs in per_root_to_indices.items():
+                selected_indices.extend(idxs[:n])
+        elif strategy == "random":
+            g = rng if rng is not None else torch.Generator().manual_seed(0)
+            for rid, idxs in per_root_to_indices.items():
+                if len(idxs) <= n:
+                    selected_indices.extend(idxs)
+                else:
+                    perm = torch.randperm(len(idxs), generator=g).tolist()
+                    chosen = [idxs[p] for p in perm[:n]]
+                    chosen.sort()  # keep relative original order
+                    selected_indices.extend(chosen)
+        else:
+            raise ValueError(f"Unknown strategy={strategy}")
+
+        # preserve global order of appearance
+        selected_indices.sort()
+        sliced = leaf_batch[selected_indices]
+
+        # rebuild mappings to reflect the new (sliced) order
+        new_leaf_ids = [int(x) for x in sliced.non_tensor_batch["leaf_id"]]
+        self.leaf_id_to_batch_idx = {lid: i for i, lid in enumerate(new_leaf_ids)}
+        self.batch_id_to_leaf_id = {i: lid for i, lid in enumerate(new_leaf_ids)}
+        return sliced

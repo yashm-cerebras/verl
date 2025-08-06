@@ -1,0 +1,67 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+reward_model:
+  reward_manager: dapo
+  overlong_buffer: 
+    enable: False # We try to avoid forgetting to set enable
+    len: 0
+    penalty_factor: 0.0
+    log: False
+
+algorithm:
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False # We try to avoid forgetting to set enable
+    metric: null # acc / score / seq_reward / seq_final_reward / ...
+    max_num_gen_batches: 0 # Non-positive values mean no upper limit
+
+trainer:
+  project_name: verl-tree-dapo
+
+rollout:
+  name: vllm
+  temperature: 1.0
+  top_k: -1 # 0 for hf rollout, -1 for vllm rollout
+  top_p: 1
+  prompt_length: ${data.max_prompt_length}  # not use for opensource
+  response_length: ${data.max_response_length}
+  # for vllm rollout
+  dtype: bfloat16 # should align with FSDP
+  gpu_memory_utilization: 0.5
+  ignore_eos: False
+  enforce_eager: True
+  free_cache_engine: True
+  load_format: dummy_dtensor
+  tensor_model_parallel_size: 2
+  max_num_batched_tokens: 8192
+  max_num_seqs: 1024
+  log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
+  log_prob_micro_batch_size_per_gpu: 16
+  log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+  log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+  # for hf rollout
+  do_sample: True
+  engine_kwargs: # inference engine parameters
+    vllm:
+      swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
+      disable_mm_preprocessor_cache: False # disable preprocessor cache for multimodel models
+    sglang:
+      attention_backend: null # null means use the engine default value, available options: flashinfer, triton, flashmla
+
+  n: 5 # for each prompt, sample n responses (i.e. num sample times). set it to values > 1 for grpo, rloo
+  val_kwargs:
+    # sampling parameters for validation
+    top_k: -1 # 0 for hf rollout, -1 for vllm rollout
+    top_p: 1.0
+    temperature: 0
+    n: 1
+    do_sample: False # default eager for validation
