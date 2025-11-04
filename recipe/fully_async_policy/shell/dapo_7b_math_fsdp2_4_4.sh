@@ -9,9 +9,9 @@ exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-4-4'
 # WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 # RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 # Paths
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
+RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/yash-verl/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
+MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen2.5-7B"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
@@ -35,10 +35,10 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # Response length parameters
-max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 8))
+max_prompt_length=$((1024 * 1))
+max_response_length=$((1024 * 1))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 4))
+overlong_buffer_len=$((1024 * 1))
 overlong_penalty_factor=1.0
 
 # Training parameters
@@ -52,8 +52,8 @@ val_top_p=0.7
 
 # Performance Related Parameter
 use_dynamic_bsz=True
-actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
+actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 1))
+infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 ref_offload=True
 actor_offload=False
 gen_tp=1
